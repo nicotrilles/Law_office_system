@@ -1,0 +1,5 @@
+# Runtime dependencies. Versions are pinned so every team member gets the same behaviour.
+Django==5.2.19
+psycopg[binary]==3.3.9
+django-environ==0.14.0
+argon2-cffi==25.1.0

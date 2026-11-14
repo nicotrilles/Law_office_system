@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Access denied | Jumamil Law System{% endblock %}
+{% block content %}
+  <h1>Access denied</h1>
+  <p>You do not have permission to do that, or your session has expired. Please try again.</p>
+  <p><a href="{% url 'home' %}">Return to the home page</a></p>
+{% endblock %}

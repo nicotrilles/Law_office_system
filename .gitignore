@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets and local configuration: NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Runtime files
+logs/
+staticfiles/
+storage/*
+!storage/.gitkeep
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
