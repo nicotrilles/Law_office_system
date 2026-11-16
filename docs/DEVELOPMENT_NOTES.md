@@ -8,7 +8,7 @@ confirmed office policy.
 | ID | Decision |
 |---|---|
 | D1 | Django 5.2 LTS, PostgreSQL, server-rendered pages. |
-| D2 | Build incrementally. Create each module's tables when that module is built. The schema checkpoint (v1.2) stays the provisional reference. |
+| D2 | Build incrementally. Create each module's tables when that module is built. The schema checkpoint (now v1.3) stays the provisional reference. |
 | D3 | The initial Attorney account is created by a one-time command-line command with a securely prompted password. No default credentials. |
 | D4 | Seed the two roles and the permission definitions. Keep role-to-permission assignments **out of** the official seed data until the Attorney's permissions are validated. Development-only fixtures must be clearly labeled. |
 | D5 | Conservative, configurable technical defaults for password length, session expiry, and login throttling, documented as provisional. |
@@ -23,8 +23,8 @@ confirmed office policy.
 | 3 | Client management | |
 | 4 | Request and document management | |
 | 5 | Templates and document preparation | |
-| 6 | Review, printing, and signing | |
-| 7 | Archiving and OCR | |
+| 6 | Review, printing, and signing (includes manual entry of registration details) | |
+| 7 | Archiving and OCR (includes OCR extraction of registration details, staff verification, and registration search) | |
 
 Note: the custom user model had to be created in Milestone 1 (it cannot be changed safely after
 the first migration), so ROLES and USERS exist now. PERMISSIONS and ROLE_PERMISSIONS arrive with
@@ -64,6 +64,10 @@ Sessions also end when the browser closes. No absolute session lifetime is set.
 | X-PD-002 | Who performs the initial Attorney setup. |
 | A-01 | The office's time zone. `Asia/Manila` in `.env.example` is an assumption to confirm. |
 | X-TF-001/002 | Rich-text editor and DOCX fidelity. Not part of this milestone. |
+| X-UQ-023 | When registration details are entered relative to review, approval, and printing, and the effect on versions. **Resolve before Milestone 6.** |
+| X-UQ-024 | What "relevant registration information" exists beyond the four fields, and whether all four must be complete. |
+| X-UQ-025 | Whether the system records the Attorney's confirmation that the document matches the physical register entry. |
+| X-UQ-011 / X-UQ-012 | Which document types require registration, and the correction procedure. |
 
 ## 6. Known limitations
 
@@ -71,3 +75,38 @@ Sessions also end when the browser closes. No absolute session lifetime is set.
 - `/health/` is intentionally minimal. It reports only `ok` or `unavailable`.
 - Static files are served only by the development server. Production static serving depends on hosting.
 - The test suite needs a PostgreSQL user allowed to create databases.
+
+## 7. Notarial registration and OCR: constraints for later milestones (confirmed 16 November 2026)
+
+No registration or OCR code exists yet (Milestone 1 contains only `ROLES` and `USERS`), so nothing in
+the implementation conflicts with these decisions. They are recorded here so later milestones follow them.
+
+**Must not be built (confirmed restrictions)**
+- No automatic generation, reservation, or "suggest the next number" logic for Doc. No.
+- No page or book rollover calculation.
+- No OCR value treated as verified until a staff member verifies it.
+- Nothing that presents the system as the official Notarial Register.
+
+**Must be supported**
+- Manual entry of Doc. No., Page No., Book No., and Series of (a calendar year, for example 2026) on a document. Never on a client or a request.
+- No uniqueness constraint on Doc. No. (numbering restarts each year) or on Book No. plus Page No. (several entries share a page). A duplicate Series plus Doc. No. should only show a warning.
+- OCR extraction of these fields as suggestions, staff verification and correction, and filtering by registration year, Doc. No., Page No., and Book No.
+- The original scanned file is preserved unchanged.
+
+**Where it fits**
+
+| Work | Milestone | Depends on |
+|---|---|---|
+| Registration entry, printing, signing | 6 | X-UQ-023 answered first |
+| OCR extraction, verification, registration search | 7 | Representative scans from the office for the OCR feasibility tests (X-TF-003, X-TF-004) |
+
+**Permissions.** Permission keys are added by the milestone that uses them, so Milestone 2 seeds only
+what it needs. Likely future keys (provisional names): `registration.record`, `registration.correct`,
+`archive.verify_metadata`. Which role holds each stays unassigned until validated (D4, X-UQ-007).
+
+**Recommendation (not a requirement).** Wherever registration details appear, show a short label such as
+"Recorded copy. The official record is the physical Notarial Register." This keeps staff from mistaking
+the system for the register.
+
+**Proposed, not applied.** A four-digit-year CHECK on Series of and two search indexes are described as
+P-1 and P-2 in the schema checkpoint, section 11B. They await approval and affect nothing built so far.

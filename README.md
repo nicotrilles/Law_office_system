@@ -4,7 +4,7 @@ Web-based legal document archiving and tracking system with OCR integration for 
 Internal use only. Roles: Office Staff and Attorney (clients have no accounts).
 
 **Status:** Milestone 1 (project foundation). See `docs/DEVELOPMENT_NOTES.md` for decisions, the
-milestone plan, provisional settings, and notes on the logical schema checkpoint (v1.2).
+milestone plan, provisional settings, and notes on the logical schema checkpoint (v1.3).
 
 ## Requirements
 
@@ -79,7 +79,7 @@ apps/accounts/     ROLES and USERS (custom user model). Login and permissions co
 templates/ static/ shared page layout and CSS
 storage/           future document storage. Git-ignored and never served by a URL.
 logs/              rotating application log. Git-ignored.
-docs/              development notes
+docs/              development notes (decisions, milestones, schema deviations)
 ```
 
 ## Rules this project follows
@@ -90,3 +90,17 @@ docs/              development notes
 - Uploaded documents will never be stored in a publicly served folder.
 - Database tables follow the provisional logical schema checkpoint. Each module's tables are
   created when that module is built.
+- Notarial registration details (Doc. No., Page No., Book No., Series of) are entered manually by
+  staff. The system never generates, reserves, or rolls over these numbers, and it is not a
+  replacement for the Attorney's physical Notarial Register.
+- OCR results are suggestions until a staff member verifies them. Original scans are preserved
+  unchanged.
+
+## Requirements and design documents
+
+The requirements and design live in separate documents. Keep them in the repository (for example
+under `docs/`) and treat them as the reference:
+
+- Systems Analysis and Development Handoff Document (v1.1): requirements and confirmed decisions
+- Logical Schema Checkpoint (v1.3): provisional database design and open questions
+- Status Transition Model (v0.3): draft document workflow
