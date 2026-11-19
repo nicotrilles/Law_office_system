@@ -91,8 +91,8 @@ AUTH_USER_MODEL = "accounts.User"
 # ---------------------------------------------------------------------------
 PASSWORD_MIN_LENGTH = env.int("PASSWORD_MIN_LENGTH", default=12)
 SESSION_IDLE_TIMEOUT_SECONDS = env.int("SESSION_IDLE_TIMEOUT_SECONDS", default=1800)
-LOGIN_MAX_ATTEMPTS = env.int("LOGIN_MAX_ATTEMPTS", default=5)  # Used from Milestone 3
-LOGIN_LOCKOUT_MINUTES = env.int("LOGIN_LOCKOUT_MINUTES", default=15)  # Used from Milestone 3
+LOGIN_MAX_ATTEMPTS = env.int("LOGIN_MAX_ATTEMPTS", default=5)  # Used from Milestone 2
+LOGIN_LOCKOUT_MINUTES = env.int("LOGIN_LOCKOUT_MINUTES", default=15)  # Used from Milestone 2
 
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.Argon2PasswordHasher"]
 

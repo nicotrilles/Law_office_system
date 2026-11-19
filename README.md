@@ -75,7 +75,7 @@ Then open http://127.0.0.1:8000/ and http://127.0.0.1:8000/health/.
 ```
 config/            settings (base / dev / prod), root URLs
 apps/core/         shared pieces: error pages, health check, base model, check_database command
-apps/accounts/     ROLES and USERS (custom user model). Login and permissions come in Milestone 3.
+apps/accounts/     ROLES and USERS (custom user model). Login and permissions come in Milestone 2.
 templates/ static/ shared page layout and CSS
 storage/           future document storage. Git-ignored and never served by a URL.
 logs/              rotating application log. Git-ignored.

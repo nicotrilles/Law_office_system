@@ -4,22 +4,22 @@ Everything here is **provisional** unless explicitly marked confirmed. Nothing i
 confirmed office policy.
 
 ## 1. Approved decisions (project team review)
-
+## APPROVED
 | ID | Decision |
 |---|---|
 | D1 | Django 5.2 LTS, PostgreSQL, server-rendered pages. |
 | D2 | Build incrementally. Create each module's tables when that module is built. The schema checkpoint (now v1.3) stays the provisional reference. |
 | D3 | The initial Attorney account is created by a one-time command-line command with a securely prompted password. No default credentials. |
-| D4 | Seed the two roles and the permission definitions. Keep role-to-permission assignments **out of** the official seed data until the Attorney's permissions are validated. Development-only fixtures must be clearly labeled. |
+| D4 | Seed **only the two roles** (`Office Staff` and `Attorney`). Permission definitions and role-to-permission assignments **remain empty** in Milestone 2 (decision Q5). Assignments stay out of the official seed data until the Attorney's permissions are validated, and a permission definition is added only by the milestone whose features need it, after its keys are approved. Development-only fixtures must be clearly labeled. |
 | D5 | Conservative, configurable technical defaults for password length, session expiry, and login throttling, documented as provisional. |
-| D6 | Work in the real project directory with version history (Claude Code was chosen). |
+| D6 | Intended working method: work in the real project directory with version history (Claude Code). Milestone 1 itself was built in a chat session and delivered as a zip, so it has no version history until it is committed to the repository. |
 
 ## 2. Milestone plan
 
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Project skeleton, configuration, database connection, custom user model foundation | **Done, awaiting review** |
-| 2 | Authentication and authorization | Next |
+| 2 | Authentication and authorization | **In progress.** Stage 1 of 8 (housekeeping) delivered, awaiting review. See section 8. |
 | 3 | Client management | |
 | 4 | Request and document management | |
 | 5 | Templates and document preparation | |
@@ -28,7 +28,12 @@ confirmed office policy.
 
 Note: the custom user model had to be created in Milestone 1 (it cannot be changed safely after
 the first migration), so ROLES and USERS exist now. PERMISSIONS and ROLE_PERMISSIONS arrive with
-authorization.
+authorization (Milestone 2).
+
+Numbering: the build order approved in D2 listed "database connection and initial migrations" as a
+separate second item and authentication as the third. The first delivery combined the skeleton and the
+database connection into Milestone 1, so authentication is **Milestone 2**. Earlier code comments that
+said "Milestone 3" were corrected in Stage 1.
 
 ## 3. Provisional settings (D5): not office policy
 
@@ -48,7 +53,7 @@ Sessions also end when the browser closes. No absolute session lifetime is set.
 
 | Topic | What was done | Why |
 |---|---|---|
-| `last_login` | Deliberately **not** created. | The USERS schema has no such column. Login events will go to ACTIVITY_LOGS. |
+| `last_login` | Deliberately **not** created. | The USERS schema has no such column. Login events will be recorded in an activity log in a later milestone (the activity log is deferred, section 8). |
 | Foreign keys | Django creates them as `NO ACTION, DEFERRABLE INITIALLY DEFERRED`, and Django's `PROTECT` blocks deletion in the application. | The checkpoint says `ON DELETE RESTRICT`. The effect is the same (deletion is refused), but the database check happens at commit time. |
 | Username uniqueness | A normal unique constraint **and** a case-insensitive unique index. | Django requires a plain unique constraint on the username field. The index enforces the checkpoint's case-insensitive rule. |
 | Django built-in tables | `auth_permission`, `auth_group`, `django_session`, `django_content_type`, `django_migrations` exist. | These are framework tables. `auth_permission` and `auth_group` are **unused**. The system's own ROLES/PERMISSIONS/ROLE_PERMISSIONS are the only authority (PD-F). |
@@ -68,6 +73,10 @@ Sessions also end when the browser closes. No absolute session lifetime is set.
 | X-UQ-024 | What "relevant registration information" exists beyond the four fields, and whether all four must be complete. |
 | X-UQ-025 | Whether the system records the Attorney's confirmation that the document matches the physical register entry. |
 | X-UQ-011 / X-UQ-012 | Which document types require registration, and the correction procedure. |
+| Audit trail | Deferred to a later milestone (Milestone 2 decision Q3). Until then, authentication events are written only to the technical server log, which is not tamper-evident. Failed sign-ins for unknown usernames cannot be stored in `ACTIVITY_LOGS` because `user_id` is required (X-UQ-018). |
+| Password change and reset | No requirement says how a person changes a password, or how the Attorney recovers if locked out. Milestone 2 does not deliver this. A developer-run recovery procedure should be agreed before real use. |
+| Assigning permissions to roles | No tool exists in Milestone 2 (D4). Before Milestone 3 can be used end to end, an approved assignment command or a clearly labeled development fixture is needed. |
+| X-PD-001 / X-UQ-007 | Whether the Attorney manages users, and the real permission matrix. Nothing is assigned in Milestone 2. |
 
 ## 6. Known limitations
 
@@ -110,3 +119,46 @@ the system for the register.
 
 **Proposed, not applied.** A four-digit-year CHECK on Series of and two search indexes are described as
 P-1 and P-2 in the schema checkpoint, section 11B. They await approval and affect nothing built so far.
+
+## 8. Milestone 2: approved plan (Revision 3)
+
+The full plan is in `MILESTONE_2_PLAN.md`. This is the short record of what was approved. All technical
+values remain provisional, and nothing here is confirmed office policy.
+
+**Decisions**
+
+| # | Decision | Outcome |
+|---|---|---|
+| Q1 | Failed-login counts stored in Django's database-backed cache | Approved |
+| Q2 | Throttle key: username (any letter case) plus network address; fixed lock | Approved |
+| Q3 | Activity log | **Deferred** to a later milestone |
+| Q4 | Two management commands for accounts (`create_user`, `set_user_status`); no web user management yet | Approved |
+| Q5 | Seed no permission definitions and no role-permission assignments | Approved |
+| Q6 | The home page requires sign-in | Approved |
+| Q7 | Refuse initial Attorney setup if any Attorney-role account exists, active or inactive | Approved |
+| Q8 | Command names and behavior | Approved |
+| Q9 | Composite primary key on `role_permissions` | Approved |
+| Q10 | Documentation and milestone-numbering corrections | Approved (this Stage 1) |
+
+**Details confirmed (D-1 to D-9, with four clarifications):** `create_user` refuses the Attorney role;
+`set_user_status` refuses to deactivate the last active Attorney and locks the `Attorney` row of `roles`
+first; a dedicated cache named `login_throttle`; the throttle fails closed; the username limit (50
+characters) and full-name limit (150) are read from the model fields; the cache table is created by the
+documented `createcachetable` step; the login view receives both `form_class=LoginForm` and
+`template_name="accounts/login.html"`; test permission keys are temporary and the test registry is always
+restored.
+
+**Stages**
+
+| Stage | Content | Status |
+|---|---|---|
+| 1 | Housekeeping: comments and documentation | Delivered, awaiting review |
+| 2 | Permission tables and reference data | Not started |
+| 3 | Initial Attorney setup command | Not started |
+| 4 | Account administration commands | Not started |
+| 5 | Login and logout | Not started |
+| 6 | Login throttling | Not started |
+| 7 | Authorization service and view guard | Not started |
+| 8 | Protect the home page, final documentation, full verification | Not started |
+
+Each stage ends with a review. The next stage does not start until the previous one is approved.

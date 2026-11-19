@@ -1,8 +1,8 @@
 """
-Access-control models (logical schema checkpoint v1.2, section 4.1).
+Access-control models (logical schema checkpoint v1.3, section 4.1).
 
 Milestone 1 only defines ROLES and USERS, because the custom user model must exist
-before the first migration. PERMISSIONS and ROLE_PERMISSIONS arrive in Milestone 3.
+before the first migration. PERMISSIONS and ROLE_PERMISSIONS arrive in Milestone 2.
 
 Django's built-in Permission and Group tables are NOT used. Application code will check
 permission keys through the user's role (PD-F), never role names and never per-user overrides.
@@ -13,7 +13,7 @@ from django.db.models.functions import Lower
 
 
 class Role(models.Model):
-    """ROLES: seeded with 'Office Staff' and 'Attorney' in Milestone 3."""
+    """ROLES: seeded with 'Office Staff' and 'Attorney' in Milestone 2."""
 
     role_id = models.BigAutoField(primary_key=True)
     role_name = models.CharField(max_length=50, unique=True)
@@ -51,7 +51,7 @@ class UserManager(BaseUserManager):
     def create_superuser(self, *args, **kwargs):
         raise NotImplementedError(
             "This project has no superuser concept. The initial Attorney account is created "
-            "by the one-time setup command (Milestone 3)."
+            "by the one-time setup command (Milestone 2)."
         )
 
 
@@ -79,7 +79,8 @@ class User(AbstractBaseUser):
     updated_at = models.DateTimeField(auto_now=True)
 
     # The schema has no last_login column. Setting this to None removes the field Django
-    # would otherwise add. Login events will be recorded in ACTIVITY_LOGS instead.
+    # would otherwise add. Login events will be recorded in an activity log in a later
+    # milestone (the activity log is deferred).
     last_login = None
 
     USERNAME_FIELD = "username"
