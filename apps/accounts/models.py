@@ -110,3 +110,44 @@ class User(AbstractBaseUser):
 
     def __str__(self):
         return self.username
+
+
+class Permission(models.Model):
+    """PERMISSIONS table (checkpoint 4.1.2). This is NOT Django's built-in Permission model.
+
+    Authorization uses only this table and ROLE_PERMISSIONS, reached through the user's role.
+    No rows are seeded and none are assigned in Milestone 2.
+    """
+
+    permission_id = models.BigAutoField(primary_key=True)
+    permission_key = models.CharField(max_length=100, unique=True)
+    module = models.CharField(max_length=50)
+    description = models.CharField(max_length=255, null=True, blank=True)
+
+    class Meta:
+        db_table = "permissions"
+        default_permissions = ()
+
+    def __str__(self):
+        return self.permission_key
+
+
+class RolePermission(models.Model):
+    """ROLE_PERMISSIONS table (checkpoint 4.1.3): a row means the role holds the permission.
+
+    The primary key is the pair (role_id, permission_id), so a row's ``pk`` is a tuple.
+    To refuse a duplicate pair use ``objects.create()``. Calling ``save()`` on a pair that already
+    exists silently does nothing.
+    """
+
+    pk = models.CompositePrimaryKey("role_id", "permission_id")
+    role = models.ForeignKey(
+        Role, on_delete=models.PROTECT, db_column="role_id", related_name="role_permissions"
+    )
+    permission = models.ForeignKey(
+        Permission, on_delete=models.PROTECT, db_column="permission_id", related_name="role_permissions"
+    )
+
+    class Meta:
+        db_table = "role_permissions"
+        default_permissions = ()
