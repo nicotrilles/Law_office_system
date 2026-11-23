@@ -22,6 +22,8 @@ class Command(BaseCommand):
                 version = cursor.fetchone()[0]
             executor = MigrationExecutor(connection)
             pending = executor.migration_plan(executor.loader.graph.leaf_nodes())
+            throttle_table = settings.CACHES["login_throttle"]["LOCATION"]
+            throttle_table_present = throttle_table in connection.introspection.table_names()
         except DatabaseError as exc:
             logger.exception("check_database failed")
             raise CommandError(
@@ -36,3 +38,10 @@ class Command(BaseCommand):
         self.stdout.write(f"  User     : {db['USER']}")
         self.stdout.write(f"  PostgreSQL version: {version}")
         self.stdout.write(f"  Unapplied migrations: {len(pending)}")
+        if throttle_table_present:
+            self.stdout.write(f"  Sign-in throttle table ({throttle_table}): present")
+        else:
+            self.stdout.write(self.style.WARNING(
+                f"  Sign-in throttle table ({throttle_table}): MISSING. "
+                "Sign-in is refused until you run: python manage.py createcachetable"
+            ))

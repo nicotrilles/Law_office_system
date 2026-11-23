@@ -1,0 +1,1121 @@
+diff --git a/README.md b/README.md
+index 9069cbc..0256376 100644
+--- a/README.md
++++ b/README.md
+@@ -63,6 +63,7 @@ python -c "from django.core.management.utils import get_random_secret_key as g;
+ 
+ ```
+ python manage.py migrate
++python manage.py createcachetable
+ python manage.py check_database
+ python manage.py test
+ python manage.py runserver
+diff --git a/apps/accounts/forms.py b/apps/accounts/forms.py
+new file mode 100644
+index 0000000..b8dfa38
+--- /dev/null
++++ b/apps/accounts/forms.py
+@@ -0,0 +1,46 @@
++from django.conf import settings
++from django.contrib.auth.forms import AuthenticationForm
++from django.core.exceptions import ValidationError
++
++from . import throttle
++
++GENERIC_LOGIN_ERROR = "The username or password is incorrect."
++UNAVAILABLE_ERROR = "Sign-in is temporarily unavailable. Please contact the system administrator."
++
++
++def locked_error():
++    minutes = settings.LOGIN_LOCKOUT_MINUTES
++    unit = "minute" if minutes == 1 else "minutes"
++    return f"Too many failed sign-in attempts. Please wait {minutes} {unit} and try again."
++
++
++class LoginForm(AuthenticationForm):
++    """Django's login form with ONE message for every failure, plus failed-attempt throttling.
++
++    A wrong password, an unknown username, and a deactivated account all show the same text, so the
++    page never reveals which usernames exist. (Django's own text also wrongly says usernames are
++    case-sensitive; ours are not.) The lock message is the same for every username, real or not.
++    """
++
++    error_messages = {
++        "invalid_login": GENERIC_LOGIN_ERROR,
++        "inactive": GENERIC_LOGIN_ERROR,
++    }
++
++    def clean(self):
++        username = self.cleaned_data.get("username")
++        if username is None or not self.cleaned_data.get("password"):
++            return super().clean()  # required-field errors only; nothing to count
++        address = throttle.client_address(self.request)
++        try:
++            if throttle.is_locked(username, address):
++                raise ValidationError(locked_error(), code="locked")  # password is NOT checked
++            try:
++                cleaned = super().clean()
++            except ValidationError:
++                throttle.record_failure(username, address)
++                raise
++            throttle.clear(username, address)
++            return cleaned
++        except throttle.ThrottleUnavailable:
++            raise ValidationError(UNAVAILABLE_ERROR, code="unavailable")  # fail closed
+diff --git a/apps/accounts/management/commands/create_user.py b/apps/accounts/management/commands/create_user.py
+new file mode 100644
+index 0000000..309e9eb
+--- /dev/null
++++ b/apps/accounts/management/commands/create_user.py
+@@ -0,0 +1,51 @@
++"""Usage: python manage.py create_user
++
++Creates an OFFICE STAFF account. This command has no --role option and cannot create an Attorney
++(use setup_attorney for the one Attorney). The password is typed at a hidden prompt. Assigns no
++permissions.
++"""
++import logging
++
++from django.core.management.base import BaseCommand, CommandError
++from django.db import IntegrityError
++from django.db.utils import OperationalError, ProgrammingError
++
++from apps.accounts import reference_data
++from apps.accounts.management import prompts
++from apps.accounts.models import Role, User
++
++logger = logging.getLogger(__name__)
++
++
++class Command(BaseCommand):
++    help = "Create an Office Staff account (password typed at a hidden prompt). Cannot create an Attorney."
++
++    def add_arguments(self, parser):
++        parser.add_argument("--username", help="Asked for if omitted.")
++        parser.add_argument("--full-name", dest="full_name", help="Asked for if omitted.")
++
++    def handle(self, *args, **options):
++        prompts.require_interactive()
++        try:
++            reference_data.sync_roles()
++            role = Role.objects.get(role_name=reference_data.OFFICE_STAFF_ROLE)
++        except reference_data.RoleNameConflict as exc:
++            raise CommandError(str(exc))
++        except (ProgrammingError, OperationalError):
++            logger.exception("create_user could not reach the roles table")
++            raise CommandError(prompts.MIGRATE_HINT)
++
++        username = prompts.clean_username(options["username"] or input("Username: "))
++        full_name = prompts.clean_full_name(options["full_name"] or input("Full name: "))
++        if User.objects.filter(username__iexact=username).exists():
++            raise CommandError("That username is already in use.")
++        password = prompts.read_new_password(username, full_name, self.stderr.write)
++
++        try:
++            User.objects.create_user(username, full_name, role, password)
++        except IntegrityError:
++            raise CommandError("That username is already in use.")
++
++        logger.info("Office Staff account created: %s", username)
++        self.stdout.write(self.style.SUCCESS(f'Created Office Staff account "{username}".'))
++        self.stdout.write("No permissions have been assigned.")
+diff --git a/apps/accounts/management/commands/setup_attorney.py b/apps/accounts/management/commands/setup_attorney.py
+new file mode 100644
+index 0000000..531b772
+--- /dev/null
++++ b/apps/accounts/management/commands/setup_attorney.py
+@@ -0,0 +1,65 @@
++"""Usage: python manage.py setup_attorney
++
++Creates the one initial Attorney account. Refuses if ANY Attorney account already exists, active or
++inactive. The password is typed at a hidden prompt, validated, and stored only as an Argon2 hash.
++Assigns no permissions and creates no Django superuser.
++"""
++import logging
++
++from django.core.management.base import BaseCommand, CommandError
++from django.db import IntegrityError, transaction
++from django.db.utils import OperationalError, ProgrammingError
++
++from apps.accounts import reference_data
++from apps.accounts.management import prompts
++from apps.accounts.models import Role, User
++
++logger = logging.getLogger(__name__)
++
++ALREADY_EXISTS = (
++    "An Attorney account already exists (active or inactive), so no new one was created. "
++    "Only one Attorney account is allowed."
++)
++
++
++class Command(BaseCommand):
++    help = "Create the one initial Attorney account (password typed at a hidden prompt)."
++
++    def add_arguments(self, parser):
++        parser.add_argument("--username", help="Asked for if omitted.")
++        parser.add_argument("--full-name", dest="full_name", help="Asked for if omitted.")
++
++    def handle(self, *args, **options):
++        prompts.require_interactive()
++        try:
++            reference_data.sync_roles()  # makes sure the two roles exist (safe to repeat)
++        except reference_data.RoleNameConflict as exc:
++            raise CommandError(str(exc))
++        except (ProgrammingError, OperationalError):
++            logger.exception("setup_attorney could not reach the roles table")
++            raise CommandError(prompts.MIGRATE_HINT)
++
++        # Refuse early, before asking for anything.
++        if User.objects.filter(role__role_name=reference_data.ATTORNEY_ROLE).exists():
++            raise CommandError(ALREADY_EXISTS)
++
++        username = prompts.clean_username(options["username"] or input("Username: "))
++        full_name = prompts.clean_full_name(options["full_name"] or input("Full name: "))
++        if User.objects.filter(username__iexact=username).exists():
++            raise CommandError("That username is already in use.")
++        password = prompts.read_new_password(username, full_name, self.stderr.write)
++
++        try:
++            with transaction.atomic():
++                # Lock the Attorney role row. A second run waits here, then sees the first run's
++                # account, so two simultaneous runs cannot both succeed.
++                role = Role.objects.select_for_update().get(role_name=reference_data.ATTORNEY_ROLE)
++                if User.objects.filter(role=role).exists():
++                    raise CommandError(ALREADY_EXISTS)
++                User.objects.create_user(username, full_name, role, password)
++        except IntegrityError:
++            raise CommandError("That username is already in use.")
++
++        logger.info("Initial Attorney account created: %s", username)
++        self.stdout.write(self.style.SUCCESS(f'Created Attorney account "{username}".'))
++        self.stdout.write("No permissions have been assigned.")
+diff --git a/apps/accounts/management/prompts.py b/apps/accounts/management/prompts.py
+new file mode 100644
+index 0000000..1f8be66
+--- /dev/null
++++ b/apps/accounts/management/prompts.py
+@@ -0,0 +1,68 @@
++"""Shared input helpers for the account commands. No database access here.
++
++There is deliberately NO way to give a password on the command line (it would end up in the shell
++history). Passwords are only ever typed at a hidden prompt.
++"""
++import getpass
++import sys
++
++from django.contrib.auth.password_validation import validate_password
++from django.core.exceptions import ValidationError
++from django.core.management.base import CommandError
++
++from apps.accounts.models import User
++
++MAX_PASSWORD_ATTEMPTS = 3
++MIGRATE_HINT = (
++    "Could not read or write the roles table. Check that PostgreSQL is running and run "
++    "'python manage.py migrate' first."
++)
++
++
++def _stdin_is_interactive():
++    return sys.stdin.isatty()
++
++
++def require_interactive():
++    if not _stdin_is_interactive():
++        raise CommandError(
++            "This command asks for a password at a hidden prompt, so it must be run in an "
++            "interactive terminal."
++        )
++
++
++def _clean(raw, field, label):
++    value = (raw or "").strip()
++    if not value:
++        raise CommandError(f"The {label} cannot be empty.")
++    limit = User._meta.get_field(field).max_length  # read from the model, never typed here
++    if len(value) > limit:
++        raise CommandError(f"The {label} is too long ({len(value)} characters). The limit is {limit}.")
++    return value
++
++
++def clean_username(raw):
++    return _clean(raw, "username", "username")
++
++
++def clean_full_name(raw):
++    return _clean(raw, "full_name", "full name")
++
++
++def read_new_password(username, full_name, write):
++    """Ask twice at a hidden prompt, validate with Django's validators, allow three tries."""
++    candidate = User(username=username, full_name=full_name)  # lets the similarity validator compare
++    for _ in range(MAX_PASSWORD_ATTEMPTS):
++        password = getpass.getpass("Password: ")
++        confirmation = getpass.getpass("Password (again): ")
++        if password != confirmation:
++            write("The two passwords do not match. Try again.")
++            continue
++        try:
++            validate_password(password, user=candidate)
++        except ValidationError as exc:
++            for message in exc.messages:
++                write(message)
++            continue
++        return password
++    raise CommandError("No valid password was entered. Nothing was created.")
+diff --git a/apps/accounts/tests/test_account_commands.py b/apps/accounts/tests/test_account_commands.py
+new file mode 100644
+index 0000000..eb79e90
+--- /dev/null
++++ b/apps/accounts/tests/test_account_commands.py
+@@ -0,0 +1,205 @@
++"""setup_attorney and create_user."""
++import threading
++from io import StringIO
++from unittest import mock
++
++from django.core.management import call_command
++from django.core.management.base import CommandError
++from django.db import connections
++from django.db.utils import ProgrammingError
++from django.test import TestCase, TransactionTestCase
++
++from apps.accounts import reference_data
++from apps.accounts.management import prompts
++from apps.accounts.models import Permission, Role, RolePermission, User
++
++GOOD = "Violet-Harbor-Lantern-77"
++
++
++class CommandTestCase(TestCase):
++    """Simulates an interactive terminal and the hidden password prompt."""
++
++    def setUp(self):
++        interactive = mock.patch.object(prompts, "_stdin_is_interactive", return_value=True)
++        interactive.start()
++        self.addCleanup(interactive.stop)
++
++    def run_command(self, name, passwords=(GOOD, GOOD), username="drjumamil", full_name="Atty. Jumamil", extra=()):
++        args = ["--username", username, "--full-name", full_name, *extra]
++        out, err = StringIO(), StringIO()
++        with mock.patch("getpass.getpass", side_effect=list(passwords)) as hidden:
++            self.hidden = hidden  # recorded first, so it is correct even when the command refuses
++            call_command(name, *args, stdout=out, stderr=err)
++        return out.getvalue(), err.getvalue()
++
++    def assertFails(self, name, message_part=None, **kwargs):
++        with self.assertRaises(CommandError) as ctx:
++            self.run_command(name, **kwargs)
++        if message_part:
++            self.assertIn(message_part, str(ctx.exception))
++        return ctx.exception
++
++
++class SetupAttorneyTests(CommandTestCase):
++    def test_creates_one_active_attorney_with_a_hashed_password(self):
++        out, err = self.run_command("setup_attorney")
++        user = User.objects.get(username="drjumamil")
++        self.assertEqual(user.role.role_name, "Attorney")
++        self.assertEqual(user.account_status, "active")
++        self.assertTrue(user.password.startswith("argon2$"))
++        self.assertTrue(user.check_password(GOOD))
++        self.assertIn('Created Attorney account "drjumamil"', out)
++
++    def test_password_is_prompted_twice_hidden_and_never_printed(self):
++        out, err = self.run_command("setup_attorney")
++        self.assertEqual(self.hidden.call_count, 2)
++        self.assertNotIn(GOOD, out + err)
++
++    def test_it_creates_the_roles_and_assigns_no_permissions(self):
++        self.run_command("setup_attorney")
++        self.assertEqual(set(Role.objects.values_list("role_name", flat=True)), {"Office Staff", "Attorney"})
++        self.assertEqual(Permission.objects.count(), 0)
++        self.assertEqual(RolePermission.objects.count(), 0)
++
++    def test_it_asks_for_username_and_full_name_when_not_given(self):
++        with mock.patch("builtins.input", side_effect=["drjumamil", "Atty. Jumamil"]):
++            with mock.patch("getpass.getpass", side_effect=[GOOD, GOOD]):
++                call_command("setup_attorney", stdout=StringIO(), stderr=StringIO())
++        self.assertTrue(User.objects.filter(username="drjumamil").exists())
++
++    def test_a_weak_password_and_a_mismatch_are_rejected_and_asked_again(self):
++        out, err = self.run_command("setup_attorney", passwords=("short", "short", GOOD, "different", GOOD, GOOD))
++        self.assertIn("too short", err)
++        self.assertIn("do not match", err)
++        self.assertTrue(User.objects.get(username="drjumamil").check_password(GOOD))
++
++    def test_a_password_too_similar_to_the_username_is_rejected(self):
++        with self.assertRaises(CommandError):
++            self.run_command("setup_attorney", passwords=("drjumamil2026", "drjumamil2026") * 3)
++        self.assertFalse(User.objects.exists())
++
++    def test_three_bad_attempts_abort_and_create_nothing(self):
++        self.assertFails("setup_attorney", "Nothing was created", passwords=("short", "short") * 3)
++        self.assertFalse(User.objects.exists())
++
++    def test_a_second_run_is_refused_without_asking_for_a_password(self):
++        self.run_command("setup_attorney")
++        self.assertFails("setup_attorney", "already exists", username="another")
++        self.assertEqual(self.hidden.call_count, 0)
++        self.assertEqual(User.objects.filter(role__role_name="Attorney").count(), 1)
++
++    def test_an_inactive_attorney_still_blocks_a_second_run(self):
++        self.run_command("setup_attorney")
++        User.objects.filter(username="drjumamil").update(account_status="inactive")
++        self.assertFails("setup_attorney", "already exists", username="another")
++        self.assertEqual(User.objects.filter(role__role_name="Attorney").count(), 1)
++
++    def test_username_and_full_name_are_validated(self):
++        self.assertFails("setup_attorney", "cannot be empty", username="   ")
++        self.assertFails("setup_attorney", "too long", username="a" * 51)
++        self.assertFails("setup_attorney", "too long", full_name="n" * 151)
++        self.assertFalse(User.objects.exists())
++
++    def test_the_length_limits_match_the_model_and_the_boundary_is_accepted(self):
++        self.assertEqual(User._meta.get_field("username").max_length, 50)
++        self.assertEqual(User._meta.get_field("full_name").max_length, 150)
++        self.run_command("setup_attorney", username="a" * 50, full_name="n" * 150)
++        self.assertTrue(User.objects.filter(username="a" * 50).exists())
++
++    def test_a_username_in_use_is_refused_in_any_letter_case(self):
++        staff = Role.objects.create(role_name="Office Staff")
++        User.objects.create_user("Drjumamil", "Someone", staff, GOOD)
++        self.assertFails("setup_attorney", "already in use")
++
++    def test_non_interactive_input_is_refused(self):
++        with mock.patch.object(prompts, "_stdin_is_interactive", return_value=False):
++            self.assertFails("setup_attorney", "interactive terminal")
++        self.assertFalse(User.objects.exists())
++
++    def test_a_role_differing_only_in_capitals_stops_the_command(self):
++        Role.objects.create(role_name="attorney")
++        self.assertFails("setup_attorney", "capital letters")
++        self.assertFalse(User.objects.exists())
++
++    def test_unmigrated_database_gives_a_friendly_error(self):
++        with mock.patch.object(reference_data, "sync_roles", side_effect=ProgrammingError("no table")):
++            with self.assertLogs("apps.accounts.management.commands.setup_attorney", level="ERROR"):
++                self.assertFails("setup_attorney", "migrate")
++
++
++class CreateUserTests(CommandTestCase):
++    def test_creates_an_active_office_staff_account_with_a_hashed_password(self):
++        out, err = self.run_command("create_user", username="maria", full_name="Maria Santos")
++        user = User.objects.get(username="maria")
++        self.assertEqual(user.role.role_name, "Office Staff")
++        self.assertEqual(user.account_status, "active")
++        self.assertTrue(user.password.startswith("argon2$"))
++        self.assertNotIn(GOOD, out + err)
++        self.assertEqual(self.hidden.call_count, 2)
++
++    def test_it_assigns_no_permissions(self):
++        self.run_command("create_user", username="maria", full_name="Maria Santos")
++        self.assertEqual(Permission.objects.count(), 0)
++        self.assertEqual(RolePermission.objects.count(), 0)
++
++    def test_it_cannot_create_an_attorney(self):
++        with self.assertRaises(CommandError):
++            self.run_command("create_user", username="sneaky", full_name="Sneaky", extra=("--role", "Attorney"))
++        self.assertFalse(User.objects.filter(role__role_name="Attorney").exists())
++        self.assertFalse(User.objects.filter(username="sneaky").exists())
++
++    def test_it_works_with_and_without_an_attorney_present(self):
++        self.run_command("setup_attorney")
++        self.run_command("create_user", username="maria", full_name="Maria Santos")
++        self.assertEqual(User.objects.filter(role__role_name="Attorney").count(), 1)
++        self.assertEqual(User.objects.filter(role__role_name="Office Staff").count(), 1)
++
++    def test_duplicate_usernames_are_refused_in_any_letter_case_even_the_attorneys(self):
++        self.run_command("setup_attorney", username="DrJumamil")
++        self.assertFails("create_user", "already in use", username="drjumamil")
++
++    def test_weak_passwords_are_re_asked_and_three_failures_abort(self):
++        self.run_command("create_user", username="maria", full_name="Maria Santos", passwords=("short", "short", GOOD, GOOD))
++        self.assertTrue(User.objects.filter(username="maria").exists())
++        self.assertFails("create_user", "Nothing was created", username="ivan", passwords=("short", "short") * 3)
++        self.assertFalse(User.objects.filter(username="ivan").exists())
++
++    def test_input_is_validated_and_non_interactive_is_refused(self):
++        self.assertFails("create_user", "too long", username="a" * 51)
++        self.assertFails("create_user", "cannot be empty", full_name=" ")
++        with mock.patch.object(prompts, "_stdin_is_interactive", return_value=False):
++            self.assertFails("create_user", "interactive terminal")
++        self.assertFalse(User.objects.exists())
++
++
++class SetupAttorneyConcurrencyTests(TransactionTestCase):
++    """Two real database connections: only one of two simultaneous runs may create the Attorney."""
++
++    def test_two_simultaneous_runs_create_only_one_attorney(self):
++        reference_data.sync_roles()
++        barrier = threading.Barrier(2)
++        results = []
++
++        def run(username):
++            try:
++                barrier.wait(timeout=10)
++                call_command("setup_attorney", "--username", username, "--full-name", "Atty",
++                             stdout=StringIO(), stderr=StringIO())
++                results.append("created")
++            except CommandError:
++                results.append("refused")
++            except Exception as exc:  # anything else is a failure of the test
++                results.append(repr(exc))
++            finally:
++                connections.close_all()
++
++        with mock.patch.object(prompts, "_stdin_is_interactive", return_value=True), \
++                mock.patch("getpass.getpass", return_value=GOOD):
++            threads = [threading.Thread(target=run, args=(name,)) for name in ("atty_one", "atty_two")]
++            for t in threads:
++                t.start()
++            for t in threads:
++                t.join(timeout=60)
++
++        self.assertEqual(sorted(results), ["created", "refused"])
++        self.assertEqual(User.objects.filter(role__role_name="Attorney").count(), 1)
+diff --git a/apps/accounts/tests/test_login_logout.py b/apps/accounts/tests/test_login_logout.py
+new file mode 100644
+index 0000000..9a0a129
+--- /dev/null
++++ b/apps/accounts/tests/test_login_logout.py
+@@ -0,0 +1,142 @@
++"""Sign-in, sign-out, and protection of the home page."""
++from django.conf import settings
++from django.test import Client, TestCase
++from django.urls import reverse
++
++from apps.accounts.forms import LoginForm
++from apps.accounts.models import Role, User
++
++PASSWORD = "correct-horse-battery-staple"
++
++
++class LoginTestCase(TestCase):
++    def setUp(self):
++        self.role = Role.objects.create(role_name="Office Staff")
++        self.user = User.objects.create_user("maria", "Maria Santos", self.role, PASSWORD)
++        self.login_url = reverse("accounts:login")
++
++    def sign_in(self, username="maria", password=PASSWORD, next_url=None):
++        data = {"username": username, "password": password}
++        if next_url is not None:
++            data["next"] = next_url
++        return self.client.post(self.login_url, data)
++
++
++class LoginPageTests(LoginTestCase):
++    def test_login_page_uses_our_template_and_our_form(self):
++        response = self.client.get(self.login_url)
++        self.assertEqual(response.status_code, 200)
++        self.assertTemplateUsed(response, "accounts/login.html")
++        self.assertIsInstance(response.context["form"], LoginForm)
++
++    def test_login_page_carries_a_csrf_token(self):
++        self.assertContains(self.client.get(self.login_url), "csrfmiddlewaretoken")
++
++    def test_a_signed_in_visitor_on_the_login_page_is_sent_onward(self):
++        self.client.force_login(self.user)
++        self.assertRedirects(self.client.get(self.login_url), "/", fetch_redirect_response=False)
++
++
++class SignInTests(LoginTestCase):
++    def test_correct_credentials_sign_in_and_go_to_the_home_page(self):
++        response = self.sign_in()
++        self.assertRedirects(response, "/", fetch_redirect_response=False)
++        self.assertEqual(self.client.session["_auth_user_id"], str(self.user.pk))
++
++    def test_username_works_in_any_letter_case(self):
++        self.assertRedirects(self.sign_in(username="MARIA"), "/", fetch_redirect_response=False)
++
++    def test_wrong_password_unknown_user_and_inactive_account_show_the_same_message(self):
++        User.objects.create_user("inactive_ivan", "Ivan", self.role, PASSWORD)
++        User.objects.filter(username="inactive_ivan").update(account_status="inactive")
++        messages = []
++        for username, password in (("maria", "wrong-password-123"), ("nobody", PASSWORD), ("inactive_ivan", PASSWORD)):
++            client = Client()
++            response = client.post(self.login_url, {"username": username, "password": password})
++            self.assertEqual(response.status_code, 200)
++            self.assertNotIn("_auth_user_id", client.session)
++            messages.append(list(response.context["form"].non_field_errors()))
++        self.assertEqual(messages[0], ["The username or password is incorrect."])
++        self.assertEqual(messages[0], messages[1])
++        self.assertEqual(messages[0], messages[2])
++
++    def test_a_failed_sign_in_does_not_echo_the_password(self):
++        response = self.sign_in(password="Never-Show-This-1234")
++        self.assertNotContains(response, "Never-Show-This-1234")
++
++    def test_session_key_is_replaced_at_sign_in(self):
++        session = self.client.session
++        session["anything"] = 1
++        session.save()
++        key_before = self.client.session.session_key
++        self.sign_in()
++        self.assertNotEqual(self.client.session.session_key, key_before)
++
++    def test_session_cookie_is_httponly_and_samesite_lax(self):
++        self.sign_in()
++        cookie = self.client.cookies[settings.SESSION_COOKIE_NAME]
++        self.assertTrue(cookie["httponly"])
++        self.assertEqual(cookie["samesite"], "Lax")
++
++    def test_session_uses_the_configured_idle_timeout_and_ends_with_the_browser(self):
++        self.sign_in()
++        session = self.client.session
++        self.assertEqual(session.get_expiry_age(), settings.SESSION_COOKIE_AGE)
++        self.assertTrue(session.get_expire_at_browser_close())
++
++    def test_sign_in_without_a_csrf_token_is_refused(self):
++        client = Client(enforce_csrf_checks=True)
++        response = client.post(self.login_url, {"username": "maria", "password": PASSWORD})
++        self.assertEqual(response.status_code, 403)
++        self.assertNotIn("_auth_user_id", client.session)
++
++
++class RedirectSafetyTests(LoginTestCase):
++    def test_a_next_address_on_this_site_is_followed(self):
++        self.assertRedirects(self.sign_in(next_url="/health/"), "/health/", fetch_redirect_response=False)
++
++    def test_next_addresses_pointing_elsewhere_are_ignored(self):
++        for evil in ("https://evil.example/", "//evil.example/"):
++            self.client.logout()
++            self.assertRedirects(self.sign_in(next_url=evil), "/", fetch_redirect_response=False)
++
++
++class SignOutTests(LoginTestCase):
++    def test_sign_out_by_get_is_refused(self):
++        self.client.force_login(self.user)
++        self.assertEqual(self.client.get(reverse("accounts:logout")).status_code, 405)
++        self.assertIn("_auth_user_id", self.client.session)
++
++    def test_sign_out_by_post_ends_the_session(self):
++        self.client.force_login(self.user)
++        response = self.client.post(reverse("accounts:logout"))
++        self.assertRedirects(response, self.login_url, fetch_redirect_response=False)
++        self.assertNotIn("_auth_user_id", self.client.session)
++        self.assertEqual(self.client.get("/").status_code, 302)
++
++    def test_sign_out_without_a_csrf_token_is_refused(self):
++        client = Client(enforce_csrf_checks=True)
++        client.force_login(self.user)
++        self.assertEqual(client.post(reverse("accounts:logout")).status_code, 403)
++
++
++class ProtectionTests(LoginTestCase):
++    def test_anonymous_visitor_is_redirected_to_the_login_page(self):
++        self.assertRedirects(self.client.get("/"), f"{self.login_url}?next=/", fetch_redirect_response=False)
++
++    def test_signed_in_user_sees_the_home_page_with_name_and_sign_out_button(self):
++        self.client.force_login(self.user)
++        response = self.client.get("/")
++        self.assertEqual(response.status_code, 200)
++        self.assertContains(response, "Maria Santos")
++        self.assertContains(response, "Sign out")
++
++    def test_a_deactivated_users_existing_session_stops_working(self):
++        self.client.force_login(self.user)
++        self.assertEqual(self.client.get("/").status_code, 200)
++        User.objects.filter(pk=self.user.pk).update(account_status="inactive")
++        self.assertEqual(self.client.get("/").status_code, 302)
++
++    def test_health_check_and_error_pages_stay_public(self):
++        self.assertEqual(self.client.get("/health/").status_code, 200)
++        self.assertEqual(self.client.get("/does-not-exist/").status_code, 404)
+diff --git a/apps/accounts/tests/test_throttle.py b/apps/accounts/tests/test_throttle.py
+new file mode 100644
+index 0000000..5b7552c
+--- /dev/null
++++ b/apps/accounts/tests/test_throttle.py
+@@ -0,0 +1,167 @@
++"""Failed-login throttling. Uses the real PostgreSQL-backed cache and a fake clock."""
++import re
++from unittest import mock
++
++from django.db import connection
++from django.db.utils import ProgrammingError
++from django.test import TestCase, override_settings
++from django.urls import reverse
++
++from apps.accounts import forms, throttle
++from apps.accounts.models import Role, User
++
++PASSWORD = "correct-horse-battery-staple"
++WRONG = "Wrong-Pass-Secret-1"
++
++
++@override_settings(LOGIN_MAX_ATTEMPTS=3, LOGIN_LOCKOUT_MINUTES=10)
++class ThrottleTestCase(TestCase):
++    def setUp(self):
++        self.role = Role.objects.create(role_name="Office Staff")
++        self.user = User.objects.create_user("maria", "Maria Santos", self.role, PASSWORD)
++        self.url = reverse("accounts:login")
++        self.clock = [1_000_000.0]  # the throttle's own clock; the cache's real expiry is only housekeeping
++        patcher = mock.patch.object(throttle, "now", side_effect=lambda: self.clock[0])
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def advance(self, seconds):
++        self.clock[0] += seconds
++
++    def attempt(self, username="maria", password=PASSWORD, address="10.0.0.1", **extra):
++        return self.client.post(self.url, {"username": username, "password": password},
++                                REMOTE_ADDR=address, **extra)
++
++    def errors(self, response):
++        return list(response.context["form"].non_field_errors())
++
++    def fail(self, times, username="maria", address="10.0.0.1"):
++        return [self.errors(self.attempt(username, WRONG, address)) for _ in range(times)]
++
++    def signed_in(self):
++        return "_auth_user_id" in self.client.session
++
++
++class LockoutTests(ThrottleTestCase):
++    def test_the_throttle_table_exists_in_a_fresh_test_database(self):
++        # Django creates every database cache table when it builds the test database.
++        self.assertIn("login_throttle_cache", connection.introspection.table_names())
++
++    def test_the_nth_failure_locks_and_the_correct_password_is_then_refused(self):
++        for messages in self.fail(3):
++            self.assertEqual(messages, [forms.GENERIC_LOGIN_ERROR])
++        response = self.attempt(password=PASSWORD)
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(self.errors(response), [forms.locked_error()])
++        self.assertFalse(self.signed_in())
++
++    def test_the_lock_message_is_identical_for_real_and_unknown_usernames(self):
++        real_failures = self.fail(3, "maria")
++        unknown_failures = self.fail(3, "nobody")
++        self.assertEqual(real_failures, unknown_failures)  # same generic message while counting
++        self.assertEqual(self.errors(self.attempt("maria")), self.errors(self.attempt("nobody")))
++        self.assertEqual(self.errors(self.attempt("nobody")), [forms.locked_error()])
++
++    def test_inactive_accounts_are_counted_like_any_other(self):
++        User.objects.filter(pk=self.user.pk).update(account_status="inactive")
++        self.fail(3)
++        self.assertEqual(self.errors(self.attempt()), [forms.locked_error()])
++
++    def test_the_password_is_not_checked_while_locked(self):
++        self.fail(3)
++        with mock.patch("django.contrib.auth.forms.authenticate") as authenticate:
++            response = self.attempt()
++        authenticate.assert_not_called()
++        self.assertEqual(self.errors(response), [forms.locked_error()])
++
++    def test_a_blank_password_is_not_counted(self):
++        for _ in range(5):
++            self.attempt(password="")
++        with connection.cursor() as cursor:
++            cursor.execute("SELECT count(*) FROM login_throttle_cache")
++            self.assertEqual(cursor.fetchone()[0], 0)
++
++
++class TimingTests(ThrottleTestCase):
++    def test_the_lock_ends_after_the_lockout_time(self):
++        self.fail(3)
++        self.advance(599)
++        self.assertEqual(self.errors(self.attempt()), [forms.locked_error()])
++        self.advance(2)  # 601 seconds after the lock started
++        self.assertEqual(self.attempt().status_code, 302)
++        self.assertTrue(self.signed_in())
++
++    def test_later_attempts_do_not_extend_the_lock(self):
++        self.fail(3)                      # lock starts at t = 0 and ends at t = 600
++        self.advance(300)
++        self.attempt()                    # refused. It must NOT push the end past t = 600
++        self.advance(301)                 # t = 601
++        self.assertEqual(self.attempt().status_code, 302)
++
++    def test_the_failure_window_is_fixed_and_restarts_after_it_expires(self):
++        self.fail(2)
++        self.advance(601)                 # the fixed window has ended, so counting starts again
++        self.fail(2)                      # only 2 failures in the new window: not locked
++        self.assertEqual(self.attempt().status_code, 302)
++
++    @override_settings(LOGIN_MAX_ATTEMPTS=2, LOGIN_LOCKOUT_MINUTES=1)
++    def test_both_settings_are_honoured(self):
++        self.fail(2)
++        response = self.attempt()
++        self.assertEqual(self.errors(response), ["Too many failed sign-in attempts. Please wait 1 minute and try again."])
++        self.advance(61)
++        self.assertEqual(self.attempt().status_code, 302)
++
++
++class CountingTests(ThrottleTestCase):
++    def test_a_successful_sign_in_clears_the_count(self):
++        self.fail(2)
++        self.assertEqual(self.attempt().status_code, 302)
++        self.client.logout()
++        self.fail(2)                      # 2 + 2 would lock if the first 2 had not been cleared
++        self.assertEqual(self.attempt().status_code, 302)
++
++    def test_letter_case_does_not_create_separate_counters(self):
++        for name in ("maria", "MARIA", "Maria"):
++            self.attempt(name, WRONG)
++        self.assertEqual(self.errors(self.attempt("maria")), [forms.locked_error()])
++
++    def test_a_different_network_address_is_counted_separately(self):
++        self.fail(3, address="10.0.0.1")
++        self.assertEqual(self.attempt(address="10.0.0.2").status_code, 302)
++
++    def test_forwarded_address_headers_cannot_dodge_the_lock(self):
++        for i in range(3):
++            self.attempt(password=WRONG, HTTP_X_FORWARDED_FOR=f"203.0.113.{i}")
++        response = self.attempt(HTTP_X_FORWARDED_FOR="198.51.100.77")
++        self.assertEqual(self.errors(response), [forms.locked_error()])
++
++
++class StorageAndSafetyTests(ThrottleTestCase):
++    def test_counters_live_in_postgresql_under_hashed_keys(self):
++        self.attempt(password=WRONG)
++        with connection.cursor() as cursor:
++            cursor.execute("SELECT cache_key FROM login_throttle_cache")
++            keys = [row[0] for row in cursor.fetchall()]
++        self.assertEqual(len(keys), 1)
++        self.assertRegex(keys[0], r"login:[0-9a-f]{64}$")
++        self.assertNotIn("maria", keys[0])
++        self.assertNotIn("10.0.0.1", keys[0])
++
++    def test_logs_never_contain_the_username_or_the_password(self):
++        with self.assertLogs("apps.accounts.throttle", level="WARNING") as logs:
++            self.fail(3)
++        text = " ".join(logs.output)
++        self.assertIn("lockout started", text)
++        for secret in ("maria", WRONG, "10.0.0.1"):
++            self.assertNotIn(secret, text)
++
++    def test_sign_in_fails_closed_when_the_store_is_unavailable(self):
++        with mock.patch("django.core.cache.backends.db.DatabaseCache.get",
++                        side_effect=ProgrammingError("relation does not exist")):
++            with self.assertLogs("apps.accounts.throttle", level="ERROR") as logs:
++                response = self.attempt(password=PASSWORD)  # even the CORRECT password
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(self.errors(response), [forms.UNAVAILABLE_ERROR])
++        self.assertFalse(self.signed_in())
++        self.assertIn("createcachetable", " ".join(logs.output))
+diff --git a/apps/accounts/throttle.py b/apps/accounts/throttle.py
+new file mode 100644
+index 0000000..25eebcb
+--- /dev/null
++++ b/apps/accounts/throttle.py
+@@ -0,0 +1,92 @@
++"""Failed-login throttling (provisional defaults: LOGIN_MAX_ATTEMPTS and LOGIN_LOCKOUT_MINUTES).
++
++How it works
++- Failed sign-ins are counted per (username, network address). The username is compared without
++  regard to letter case and the pair is stored only as a SHA-256 hash, never in readable form.
++- Counting happens in a FIXED window that starts at the first failure and lasts LOGIN_LOCKOUT_MINUTES.
++  Reaching LOGIN_MAX_ATTEMPTS locks that pair for LOGIN_LOCKOUT_MINUTES.
++- While locked, attempts are refused BEFORE the password is checked, and they do NOT extend the lock.
++- A successful sign-in clears the count.
++- A username that does not exist is counted exactly like one that does, so the lock reveals nothing.
++- Counters live in the PostgreSQL-backed cache "login_throttle" (table login_throttle_cache, created
++  by `python manage.py createcachetable`). If that store is unavailable, sign-in FAILS CLOSED.
++
++The cache's own expiry is only housekeeping. Whether a pair is locked is decided from the timestamps
++stored in the value, using now() below, which tests replace to move time.
++Known limit: read-then-write is not atomic, so a burst of simultaneous attempts can slip a few extra
++guesses through before the lock lands.
++"""
++import hashlib
++import logging
++import time
++
++from django.conf import settings
++from django.core.cache import caches
++from django.db import Error as DatabaseError
++
++logger = logging.getLogger(__name__)
++
++CACHE_ALIAS = "login_throttle"
++
++
++class ThrottleUnavailable(Exception):
++    """The throttle store could not be read or written."""
++
++
++def now():
++    return time.time()
++
++
++def client_address(request):
++    # REMOTE_ADDR only. Forwarded-address headers are NOT trusted: a client could invent them.
++    return (request.META.get("REMOTE_ADDR") if request is not None else None) or "unknown"
++
++
++def _digest(username, address):
++    identity = f"{username.strip().casefold()}|{address}"
++    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
++
++
++def _window_seconds():
++    return settings.LOGIN_LOCKOUT_MINUTES * 60
++
++
++def _guard(operation):
++    try:
++        return operation()
++    except DatabaseError:
++        logger.exception(
++            "Sign-in throttle store unavailable. Sign-in is refused until it is fixed. "
++            "Run: python manage.py createcachetable"
++        )
++        raise ThrottleUnavailable from None
++
++
++def _get(digest):
++    return _guard(lambda: caches[CACHE_ALIAS].get("login:" + digest))
++
++
++def is_locked(username, address):
++    state = _get(_digest(username, address))
++    return bool(state) and state["locked_until"] > now()
++
++
++def record_failure(username, address):
++    digest = _digest(username, address)
++    state = _get(digest)
++    t = now()
++    if state and state["locked_until"] > t:
++        return  # already locked: later attempts neither count nor extend the lock
++    window = _window_seconds()
++    if not state or t - state["window_started_at"] >= window:
++        state = {"failures": 0, "window_started_at": t, "locked_until": 0}
++    state["failures"] += 1
++    if state["failures"] >= settings.LOGIN_MAX_ATTEMPTS:
++        state["locked_until"] = t + window
++        logger.warning("Sign-in lockout started (key %s)", digest[:12])
++    _guard(lambda: caches[CACHE_ALIAS].set("login:" + digest, state, timeout=2 * window))
++
++
++def clear(username, address):
++    digest = _digest(username, address)
++    _guard(lambda: caches[CACHE_ALIAS].delete("login:" + digest))
+diff --git a/apps/accounts/urls.py b/apps/accounts/urls.py
+new file mode 100644
+index 0000000..6694687
+--- /dev/null
++++ b/apps/accounts/urls.py
+@@ -0,0 +1,20 @@
++from django.contrib.auth import views as auth_views
++from django.urls import path
++
++from .forms import LoginForm
++
++app_name = "accounts"
++
++urlpatterns = [
++    path(
++        "login/",
++        auth_views.LoginView.as_view(
++            form_class=LoginForm,                    # our form: one generic error message
++            template_name="accounts/login.html",     # our page, not Django's registration/login.html
++            redirect_authenticated_user=True,        # a signed-in visitor is sent onward
++        ),
++        name="login",
++    ),
++    # LogoutView accepts POST only (Django 5), so signing out needs a form with a CSRF token.
++    path("logout/", auth_views.LogoutView.as_view(), name="logout"),
++]
+diff --git a/apps/core/management/commands/check_database.py b/apps/core/management/commands/check_database.py
+index ed3a525..3661ed5 100644
+--- a/apps/core/management/commands/check_database.py
++++ b/apps/core/management/commands/check_database.py
+@@ -22,6 +22,8 @@ class Command(BaseCommand):
+                 version = cursor.fetchone()[0]
+             executor = MigrationExecutor(connection)
+             pending = executor.migration_plan(executor.loader.graph.leaf_nodes())
++            throttle_table = settings.CACHES["login_throttle"]["LOCATION"]
++            throttle_table_present = throttle_table in connection.introspection.table_names()
+         except DatabaseError as exc:
+             logger.exception("check_database failed")
+             raise CommandError(
+@@ -36,3 +38,10 @@ class Command(BaseCommand):
+         self.stdout.write(f"  User     : {db['USER']}")
+         self.stdout.write(f"  PostgreSQL version: {version}")
+         self.stdout.write(f"  Unapplied migrations: {len(pending)}")
++        if throttle_table_present:
++            self.stdout.write(f"  Sign-in throttle table ({throttle_table}): present")
++        else:
++            self.stdout.write(self.style.WARNING(
++                f"  Sign-in throttle table ({throttle_table}): MISSING. "
++                "Sign-in is refused until you run: python manage.py createcachetable"
++            ))
+diff --git a/apps/core/tests/test_views.py b/apps/core/tests/test_views.py
+index f868860..cdfbafc 100644
+--- a/apps/core/tests/test_views.py
++++ b/apps/core/tests/test_views.py
+@@ -7,9 +7,18 @@ from django.core.management.base import CommandError
+ from django.db.utils import OperationalError
+ from django.test import Client, TestCase, override_settings
+ 
++from apps.accounts.models import Role, User
++
+ 
+ class HomeAndHealthTests(TestCase):
+-    def test_home_page_renders(self):
++    def test_home_page_requires_sign_in(self):
++        response = self.client.get("/")
++        self.assertRedirects(response, "/accounts/login/?next=/", fetch_redirect_response=False)
++
++    def test_home_page_renders_for_a_signed_in_user(self):
++        role = Role.objects.create(role_name="Office Staff")
++        user = User.objects.create_user("maria", "Maria Santos", role, "correct-horse-battery-staple")
++        self.client.force_login(user)
+         response = self.client.get("/")
+         self.assertEqual(response.status_code, 200)
+         self.assertContains(response, "Jumamil Law System")
+@@ -69,6 +78,11 @@ class CheckDatabaseCommandTests(TestCase):
+         self.assertTrue(password)
+         self.assertNotIn(password, text)
+ 
++    def test_reports_the_sign_in_throttle_table(self):
++        out = StringIO()
++        call_command("check_database", stdout=out)
++        self.assertIn("Sign-in throttle table (login_throttle_cache): present", out.getvalue())
++
+     def test_failure_gives_a_clear_message_without_the_password(self):
+         with mock.patch(
+             "apps.core.management.commands.check_database.connection.ensure_connection",
+diff --git a/apps/core/views.py b/apps/core/views.py
+index bc9e667..4b65ec6 100644
+--- a/apps/core/views.py
++++ b/apps/core/views.py
+@@ -6,6 +6,7 @@ never to the browser (NFR-SEC and the "no sensitive server errors" rule).
+ """
+ import logging
+ 
++from django.contrib.auth.decorators import login_required
+ from django.db import Error as DatabaseError
+ from django.db import connection
+ from django.http import HttpResponseServerError, JsonResponse
+@@ -16,6 +17,7 @@ from django.views.decorators.http import require_GET
+ logger = logging.getLogger(__name__)
+ 
+ 
++@login_required
+ def home(request):
+     return render(request, "home.html")
+ 
+diff --git a/config/settings/base.py b/config/settings/base.py
+index f49ada5..37017c1 100644
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@ -85,6 +85,23 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+ # ---------------------------------------------------------------------------
+ AUTH_USER_MODEL = "accounts.User"
+ 
++# Where people are sent to sign in, after signing in, and after signing out.
++LOGIN_URL = "accounts:login"
++LOGIN_REDIRECT_URL = "home"
++LOGOUT_REDIRECT_URL = "accounts:login"
++
++# Caches. Django requires "default" (nothing uses it). "login_throttle" holds failed-sign-in counters in
++# PostgreSQL, so they survive restarts and are shared by every server process. Create its table once with:
++#     python manage.py createcachetable
++# (Test databases get the table automatically.)
++CACHES = {
++    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
++    "login_throttle": {
++        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
++        "LOCATION": "login_throttle_cache",
++    },
++}
++
+ # ---------------------------------------------------------------------------
+ # Provisional security defaults (D5). These are technical development settings,
+ # NOT confirmed office policy. They are configurable through environment variables.
+diff --git a/config/urls.py b/config/urls.py
+index cb84dfb..fa0ee04 100644
+--- a/config/urls.py
++++ b/config/urls.py
+@@ -8,5 +8,6 @@ handler404 = "apps.core.views.page_not_found"
+ handler500 = "apps.core.views.server_error"
+ 
+ urlpatterns = [
++    path("accounts/", include("apps.accounts.urls")),
+     path("", include("apps.core.urls")),
+ ]
+diff --git a/static/css/app.css b/static/css/app.css
+index 68cf3a6..7ebc490 100644
+--- a/static/css/app.css
++++ b/static/css/app.css
+@@ -14,3 +14,13 @@ main.container { padding-top:1.5rem; padding-bottom:3rem; min-height:60vh; }
+ .message.error { border-color:#c53030; background:#fff5f5; }
+ .message.warning { border-color:#b7791f; background:#fffaf0; }
+ a { color:var(--brand); }
++
++.site-header nav { display:flex; align-items:center; gap:1rem; }
++.nav-user { color:#dbe4ee; font-size:.9rem; }
++.inline-form { margin:0; }
++button.linklike { background:none; border:1px solid #dbe4ee; color:#fff; border-radius:.25rem; padding:.25rem .7rem; cursor:pointer; font:inherit; }
++button.linklike:hover { background:rgba(255,255,255,.12); }
++.login-form { max-width:24rem; }
++.login-form input[type=text], .login-form input[type=password] { width:100%; padding:.5rem; border:1px solid var(--line); border-radius:.25rem; font:inherit; }
++.login-form button { padding:.5rem 1.2rem; border:0; border-radius:.25rem; background:var(--brand); color:#fff; font:inherit; cursor:pointer; }
++.errorlist { color:#c53030; list-style:none; padding:0; margin:.25rem 0; }
+diff --git a/templates/accounts/login.html b/templates/accounts/login.html
+new file mode 100644
+index 0000000..034525d
+--- /dev/null
++++ b/templates/accounts/login.html
+@@ -0,0 +1,25 @@
++{% extends "base.html" %}
++{% block title %}Sign in | Jumamil Law System{% endblock %}
++{% block content %}
++  <h1>Sign in</h1>
++  <form method="post" class="login-form" novalidate>
++    {% csrf_token %}
++    {% if form.non_field_errors %}
++      <ul class="messages" role="alert">
++        {% for error in form.non_field_errors %}<li class="message error">{{ error }}</li>{% endfor %}
++      </ul>
++    {% endif %}
++    <p>
++      <label for="{{ form.username.id_for_label }}">Username</label><br>
++      {{ form.username }}
++      {{ form.username.errors }}
++    </p>
++    <p>
++      <label for="{{ form.password.id_for_label }}">Password</label><br>
++      {{ form.password }}
++      {{ form.password.errors }}
++    </p>
++    <input type="hidden" name="next" value="{{ next }}">
++    <button type="submit">Sign in</button>
++  </form>
++{% endblock %}
+diff --git a/templates/base.html b/templates/base.html
+index 236cfb8..c6dff11 100644
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -11,7 +11,14 @@
+     <div class="container">
+       <a class="brand" href="{% url 'home' %}">Jumamil Law System</a>
+       <nav aria-label="Main">
+-        {# Navigation links are added as each module is built. #}
++        {% if user.is_authenticated %}
++          <span class="nav-user">{{ user.full_name }} ({{ user.role.role_name }})</span>
++          <form method="post" action="{% url 'accounts:logout' %}" class="inline-form">
++            {% csrf_token %}
++            <button type="submit" class="linklike">Sign out</button>
++          </form>
++        {% endif %}
++        {# More navigation links are added as each module is built. #}
+       </nav>
+     </div>
+   </header>
+diff --git a/templates/home.html b/templates/home.html
+index 7b09d44..3de5c9e 100644
+--- a/templates/home.html
++++ b/templates/home.html
+@@ -2,5 +2,5 @@
+ {% block content %}
+   <h1>Jumamil Law System</h1>
+   <p>Legal document archiving and tracking for Jumamil Law Office.</p>
+-  <p class="note">Foundation milestone. Sign-in and the office modules are added in later milestones.</p>
++  <p class="note">The office modules (clients, requests, documents) are added in later milestones.</p>
+ {% endblock %}

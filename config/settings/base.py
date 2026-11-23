@@ -85,6 +85,23 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # ---------------------------------------------------------------------------
 AUTH_USER_MODEL = "accounts.User"
 
+# Where people are sent to sign in, after signing in, and after signing out.
+LOGIN_URL = "accounts:login"
+LOGIN_REDIRECT_URL = "home"
+LOGOUT_REDIRECT_URL = "accounts:login"
+
+# Caches. Django requires "default" (nothing uses it). "login_throttle" holds failed-sign-in counters in
+# PostgreSQL, so they survive restarts and are shared by every server process. Create its table once with:
+#     python manage.py createcachetable
+# (Test databases get the table automatically.)
+CACHES = {
+    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
+    "login_throttle": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "login_throttle_cache",
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Provisional security defaults (D5). These are technical development settings,
 # NOT confirmed office policy. They are configurable through environment variables.

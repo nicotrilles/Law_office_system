@@ -7,9 +7,18 @@ from django.core.management.base import CommandError
 from django.db.utils import OperationalError
 from django.test import Client, TestCase, override_settings
 
+from apps.accounts.models import Role, User
+
 
 class HomeAndHealthTests(TestCase):
-    def test_home_page_renders(self):
+    def test_home_page_requires_sign_in(self):
+        response = self.client.get("/")
+        self.assertRedirects(response, "/accounts/login/?next=/", fetch_redirect_response=False)
+
+    def test_home_page_renders_for_a_signed_in_user(self):
+        role = Role.objects.create(role_name="Office Staff")
+        user = User.objects.create_user("maria", "Maria Santos", role, "correct-horse-battery-staple")
+        self.client.force_login(user)
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Jumamil Law System")
@@ -68,6 +77,11 @@ class CheckDatabaseCommandTests(TestCase):
         password = settings.DATABASES["default"]["PASSWORD"]
         self.assertTrue(password)
         self.assertNotIn(password, text)
+
+    def test_reports_the_sign_in_throttle_table(self):
+        out = StringIO()
+        call_command("check_database", stdout=out)
+        self.assertIn("Sign-in throttle table (login_throttle_cache): present", out.getvalue())
 
     def test_failure_gives_a_clear_message_without_the_password(self):
         with mock.patch(

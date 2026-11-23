@@ -63,6 +63,7 @@ python -c "from django.core.management.utils import get_random_secret_key as g; 
 
 ```
 python manage.py migrate
+python manage.py createcachetable
 python manage.py check_database
 python manage.py test
 python manage.py runserver

@@ -6,6 +6,7 @@ never to the browser (NFR-SEC and the "no sensitive server errors" rule).
 """
 import logging
 
+from django.contrib.auth.decorators import login_required
 from django.db import Error as DatabaseError
 from django.db import connection
 from django.http import HttpResponseServerError, JsonResponse
@@ -16,6 +17,7 @@ from django.views.decorators.http import require_GET
 logger = logging.getLogger(__name__)
 
 
+@login_required
 def home(request):
     return render(request, "home.html")
 

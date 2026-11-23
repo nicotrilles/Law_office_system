@@ -8,5 +8,6 @@ handler404 = "apps.core.views.page_not_found"
 handler500 = "apps.core.views.server_error"
 
 urlpatterns = [
+    path("accounts/", include("apps.accounts.urls")),
     path("", include("apps.core.urls")),
 ]
