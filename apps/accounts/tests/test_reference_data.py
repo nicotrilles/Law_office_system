@@ -13,8 +13,16 @@ from apps.accounts.models import Permission, Role, RolePermission, User
 
 
 class RegistryTests(SimpleTestCase):
-    def test_permission_registry_is_empty(self):
-        self.assertEqual(reference_data.PERMISSION_DEFINITIONS, ())
+    def test_registry_holds_exactly_the_three_approved_definitions(self):
+        definitions = {d.key: d for d in reference_data.PERMISSION_DEFINITIONS}
+        self.assertEqual(set(definitions), {"client.view", "client.create", "client.edit"})
+        self.assertEqual(len(reference_data.PERMISSION_DEFINITIONS), 3)
+        for definition in definitions.values():
+            self.assertEqual(definition.module, "clients")
+            self.assertTrue(definition.description)
+
+    def test_service_request_permissions_are_not_defined_yet(self):
+        self.assertFalse([d for d in reference_data.PERMISSION_DEFINITIONS if d.key.startswith("request.")])
 
     def test_role_names_are_exactly_the_two_approved_roles(self):
         self.assertEqual(set(reference_data.ROLE_NAMES), {"Office Staff", "Attorney"})
@@ -89,11 +97,15 @@ class SeedCommandTests(TestCase):
     def test_first_run_output(self):
         text = self.run_command()
         self.assertIn("Roles: 2 created, 0 unchanged.", text)
-        self.assertIn("Permissions and role-permission assignments: untouched", text)
+        self.assertIn("Permissions: 3 created, 0 updated, 0 unchanged.", text)
+        self.assertIn("Role-permission assignments: untouched", text)
+        self.assertEqual(RolePermission.objects.count(), 0)
 
     def test_second_run_output(self):
         self.run_command()
-        self.assertIn("Roles: 0 created, 2 unchanged.", self.run_command())
+        text = self.run_command()
+        self.assertIn("Roles: 0 created, 2 unchanged.", text)
+        self.assertIn("Permissions: 0 created, 0 updated, 3 unchanged.", text)
 
     def test_capital_letter_conflict_gives_a_command_error(self):
         Role.objects.create(role_name="attorney")
@@ -107,3 +119,68 @@ class SeedCommandTests(TestCase):
                 with self.assertRaises(CommandError) as ctx:
                     self.run_command()
         self.assertIn("migrate", str(ctx.exception))
+
+
+class SyncPermissionsTests(TestCase):
+    def test_first_sync_creates_the_three_definitions_and_no_assignments(self):
+        result = reference_data.sync_permissions()
+        self.assertEqual(set(result.created), {"client.view", "client.create", "client.edit"})
+        self.assertEqual(Permission.objects.count(), 3)
+        self.assertEqual(set(Permission.objects.values_list("module", flat=True)), {"clients"})
+        self.assertEqual(RolePermission.objects.count(), 0)
+
+    def test_second_sync_changes_nothing(self):
+        reference_data.sync_permissions()
+        result = reference_data.sync_permissions()
+        self.assertEqual((result.created, result.updated), ([], []))
+        self.assertEqual(len(result.unchanged), 3)
+        self.assertEqual(Permission.objects.count(), 3)
+
+    def test_having_roles_and_permissions_still_creates_no_assignments(self):
+        reference_data.sync_roles()
+        reference_data.sync_permissions()
+        reference_data.sync_permissions()
+        self.assertEqual(RolePermission.objects.count(), 0)
+
+    def test_a_changed_description_updates_the_row_and_keeps_its_assignments(self):
+        reference_data.sync_roles()
+        reference_data.sync_permissions()
+        role = Role.objects.get(role_name="Office Staff")
+        RolePermission.objects.create(role=role, permission=Permission.objects.get(permission_key="client.view"))
+        changed = (reference_data.PermissionDefinition("client.view", "clients", "A new description"),)
+        with mock.patch.object(reference_data, "PERMISSION_DEFINITIONS", changed):
+            result = reference_data.sync_permissions()
+        self.assertEqual(result.updated, ["client.view"])
+        self.assertEqual(Permission.objects.get(permission_key="client.view").description, "A new description")
+        self.assertEqual(RolePermission.objects.count(), 1)
+
+    def test_a_permission_not_in_the_registry_is_reported_and_not_deleted(self):
+        Permission.objects.create(permission_key="old.key", module="old")
+        result = reference_data.sync_permissions()
+        self.assertEqual(result.orphans, ["old.key"])
+        self.assertTrue(Permission.objects.filter(permission_key="old.key").exists())
+
+
+class RegistryValidationTests(TestCase):
+    def assertRejected(self, definitions, message_part):
+        with mock.patch.object(reference_data, "PERMISSION_DEFINITIONS", definitions):
+            with self.assertRaises(reference_data.RegistryError) as ctx:
+                reference_data.sync_permissions()
+        self.assertIn(message_part, str(ctx.exception))
+        self.assertEqual(Permission.objects.count(), 0)  # nothing was written
+
+    def test_a_blank_key_or_module_is_rejected(self):
+        D = reference_data.PermissionDefinition
+        self.assertRejected((D("client.view", "clients"), D("  ", "clients")), "blank")
+        self.assertRejected((D("client.view", ""),), "blank")
+
+    def test_too_long_values_are_rejected_using_the_model_limits(self):
+        D = reference_data.PermissionDefinition
+        key_limit = Permission._meta.get_field("permission_key").max_length
+        module_limit = Permission._meta.get_field("module").max_length
+        self.assertRejected((D("k" * (key_limit + 1), "clients"),), "too long")
+        self.assertRejected((D("client.view", "m" * (module_limit + 1)),), "too long")
+
+    def test_duplicate_keys_are_rejected(self):
+        D = reference_data.PermissionDefinition
+        self.assertRejected((D("client.view", "clients"), D("client.view", "clients")), "more than once")
